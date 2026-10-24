@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 from torch import nn
@@ -13,6 +13,7 @@ def validate(
     sigreg: nn.Module,
     config: Any,
     device: torch.device,
+    dtype: Optional[torch.dtype] = None,
 ) -> Dict[str, float]:
     """Run validation over a dataloader and compute loss and representation metrics.
 
@@ -28,6 +29,9 @@ def validate(
     """
     model.eval()
 
+    if dtype is None:
+        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+
     total_pred_loss = 0.0
     total_sigreg_loss = 0.0
     total_loss = 0.0
@@ -41,27 +45,29 @@ def validate(
     sigreg_weight = getattr(config, "sigreg_weight", 0.1)
 
     for batch in dataloader:
-        if isinstance(batch, dict):
-            frames = batch["frames"].to(device, non_blocking=True)
-            actions = batch["actions"].to(device, non_blocking=True)
-        else:
-            batch = batch.to(device, non_blocking=True)
-            frames, actions = batch["frames"], batch["actions"]
+        frames = batch["frames"].to(device, non_blocking=True)
+        actions = batch["actions"].to(device, non_blocking=True)
 
-        preds, embs = model(frames, actions)
-        targets = embs[:, 1:]
+        with torch.autocast(
+            device_type=device.type,
+            dtype=dtype,
+            enabled=(device.type == "cuda" and dtype == torch.bfloat16),
+        ):
+            preds, embs = model(frames, actions)
+            targets = embs[:, 1:]
 
-        pred_loss = nn.functional.mse_loss(preds, targets)
-        sr_loss = sigreg(embs)
-        batch_total_loss = pred_loss + sigreg_weight * sr_loss
+            pred_loss = nn.functional.mse_loss(preds, targets)
+            temporal_embs = embs.transpose(0, 1)
+            sr_loss = sigreg(temporal_embs)
+            batch_total_loss = pred_loss + sigreg_weight * sr_loss
 
-        l1_err = nn.functional.l1_loss(preds, targets)
-        cos_sim = nn.functional.cosine_similarity(preds, targets, dim=-1).mean()
+            l1_err = nn.functional.l1_loss(preds, targets)
+            cos_sim = nn.functional.cosine_similarity(preds, targets, dim=-1).mean()
 
-        emb_norm = torch.linalg.vector_norm(embs, dim=-1).mean()
-        pred_norm = torch.linalg.vector_norm(preds, dim=-1).mean()
-        # Variance across batch and sequence dimensions to detect representation collapse
-        emb_std = embs.std(dim=0).mean()
+            emb_norm = torch.linalg.vector_norm(embs, dim=-1).mean()
+            pred_norm = torch.linalg.vector_norm(preds, dim=-1).mean()
+            # Variance across batch and sequence dimensions to detect representation collapse
+            emb_std = embs.std(dim=0).mean()
 
         total_loss += batch_total_loss.item()
         total_pred_loss += pred_loss.item()
