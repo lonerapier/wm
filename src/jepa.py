@@ -19,15 +19,18 @@ class SIGReg(nn.Module):
         self.knots = num_knots
         self.num_proj = num_proj
         t = torch.linspace(t_min, t_max, num_knots, device=device)
-        dt = t[1] - t[0] / (num_knots - 1)
-        trapezoid_weights = torch.full((num_knots,), 2 * dt, device=device)
-        trapezoid_weights[[0, -1]] = dt
-        phi = torch.exp(-(t**2) / (2 * lam**2))
+        dt = (t_max - t_min) / (num_knots - 1)
+        trapezoid_weights = torch.full((num_knots,), dt, device=device)
+        trapezoid_weights[[0, -1]] = 0.5 * dt
+        phi = torch.exp(-(t**2) / 2)
+        weight_func = torch.exp(-(t**2) / (2 * lam**2))
         self.register_buffer("t", t)
-        self.register_buffer("weights", phi * trapezoid_weights)
+        self.register_buffer("weights", weight_func * trapezoid_weights)
         self.register_buffer("phi", phi)
 
     def forward(self, emb: torch.Tensor) -> torch.Tensor:
+        if emb.ndim == 2:
+            emb = emb.unsqueeze(0)  # (1, B, D)
         # emb (T, B, D)
         T, B, D = emb.shape
 
@@ -56,8 +59,8 @@ class JEPA(nn.Module):
         pred_depth: int = 6,
         n_heads: int = 3,
         mlp_ratio: int = 4,
-        dropout: float = 0.0,
-        mlp_dropout: float = 0.0,
+        pred_dropout: float = 0.0,
+        pred_emb_dropout: float = 0.1,
         enc_proj_hidden_dim: int = 2048,
         num_frames: int = 4,
         pred_mlp_dim: int = 2048,
@@ -72,8 +75,6 @@ class JEPA(nn.Module):
             depth=enc_depth,
             n_heads=n_heads,
             mlp_ratio=mlp_ratio,
-            dropout=dropout,
-            mlp_dropout=mlp_dropout,
         )
         # TODO: check the dropout settings for predictor
         self.predictor = Predictor(
@@ -81,9 +82,9 @@ class JEPA(nn.Module):
             hidden_dim=hidden_dim,
             depth=pred_depth,
             n_heads=n_heads,
-            dropout=dropout,
-            mlp_dropout=mlp_dropout,
             mlp_dim=pred_mlp_dim,
+            dropout=pred_dropout,
+            emb_dropout=pred_emb_dropout,
         )
         self.action_embedder = ActionEmbedder(
             input_dim=action_dim,
@@ -116,36 +117,79 @@ class JEPA(nn.Module):
         # frames (B, T, C, H, W)
         # actions (B, T, num_actions)
 
-        embs = self.encode(frames)  # (B, T, D)
-        actions_emb = self.action_embedder(actions)  # (B, T, D)
+        assert frames.ndim == 5, f"frames.ndim: {frames.ndim}"
+        assert actions.ndim == 3, f"actions.ndim: {actions.ndim}"
+
+        embs, actions_emb = self.encode(frames, actions)  # (B, T, D)
 
         pred = self.predict(embs[:, :-1], actions_emb[:, :-1])  # (B, T-1, D)
 
         return pred, embs
 
-    def encode(self, frames: torch.Tensor) -> torch.Tensor:
+    def encode(
+        self, frames: torch.Tensor, actions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # frames (B, T, C, H, W)
         # actions (B, T, num_actions)
+
+        assert frames.ndim == 5, f"frames.ndim: {frames.ndim}"
+        assert actions.ndim == 3, f"actions.ndim: {actions.ndim}"
+
         B, T = frames.shape[:2]
         frames = rearrange(frames, "b t ... -> (b t) ...")
         emb = self.encoder(frames)
         emb = self.enc_proj(emb)
         emb = rearrange(emb, "(b t) d -> b t d", b=B, t=T)
 
-        return emb
+        action_emb = self.action_embedder(actions)
+
+        return emb, action_emb
 
     def predict(self, emb: torch.Tensor, actions_emb: torch.Tensor) -> torch.Tensor:
         # emb (B, T, D)
         # actions_emb (B, T, D)
-        B, T = emb.shape[:2]
+
+        assert emb.ndim == 3, f"emb.ndim: {emb.ndim}"
+        assert actions_emb.ndim == 3, f"actions_emb.ndim: {actions_emb.ndim}"
+
+        B, T = actions_emb.shape[:2]
         preds = self.predictor(emb, actions_emb)
         preds = self.pred_proj(rearrange(preds, "b t d -> (b t) d"))
         return rearrange(preds, "(b t) d -> b t d", b=B, t=T)
 
-    def rollout(self, init_obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        # init_obs (B, S, H, C, h, w)
-        # actions (B, S, T, action_dim)
-        B, S, H = init_obs.shape[:3]
+    def predict_rollout(self, init_obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        """Autoregressively predict future states using previous ground truth states and actions.
+
+        Args:
+            init_obs (B, S, 1, D): Initial context frames.
+            actions (B, S, T, D): Action sequences to predict over.
+
+        Returns:
+            torch.Tensor: Predicted latent states.
+        """
+
+        assert init_obs.ndim == 4, f"init_obs.ndim: {init_obs.ndim}"
+        assert actions.ndim == 4, f"actions.ndim: {actions.ndim}"
+
+        B, S = init_obs.shape[:2]
         T = actions.shape[2]
 
-        raise NotImplementedError
+        states = init_obs
+
+        max_ctx_len = self.predictor.pos_embed.shape[1]
+
+        for t in range(T):
+            ctx = min(states.shape[2], max_ctx_len)
+            state_ctx = states[:, :, -ctx:]  # (B, S, ctx, D)
+            action_ctx = actions[:, :, (t + 1 - ctx) : t + 1]  # (B, S, ctx, D)
+
+            state_ctx = rearrange(state_ctx, "b s ... -> (b s) ...")
+            action_ctx = rearrange(action_ctx, "b s ... -> (b s) ...")
+            action_emb_ctx = self.action_embedder(action_ctx)
+
+            pred_state = self.predict(state_ctx, action_emb_ctx)  # (BS, ctx, D)
+            pred_state = rearrange(pred_state, "(b s) t d -> b s t d", b=B, s=S)
+            states = torch.cat([states, pred_state[:, :, -1:]], dim=2)
+
+        # remove the original state, and return predicted states
+        return states[:, :, 1:]

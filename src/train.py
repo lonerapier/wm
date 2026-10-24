@@ -12,7 +12,13 @@ from dataset.dataset import build_dataloaders
 from eval import validate
 from jepa import JEPA, SIGReg
 from logger import Logger
-from utils import _configure_device, _set_seed, load_checkpoint, save_checkpoint
+from utils import (
+    _configure_device,
+    _configure_dtype,
+    _set_seed,
+    load_checkpoint,
+    save_checkpoint,
+)
 
 
 # TODO: add comments
@@ -21,8 +27,8 @@ from utils import _configure_device, _set_seed, load_checkpoint, save_checkpoint
 class TrainConfig:
     # experiment params
     run_id: str = "baseline"
-    wandb_enabled: bool = True
-    wandb_project: str = ""
+    wandb_enabled: bool = False
+    wandb_project: str = "wm"
     exp_dir: str = "exp"
     save_dir: str = "checkpoints"
     resume_from: str | None = None
@@ -33,31 +39,34 @@ class TrainConfig:
     """Log every `log_interval` steps."""
     save_interval: int = 5
     """Save every `save_interval` epochs."""
+    device: str | None = None
+    """Device to use for training ('cuda', 'mps', 'cpu', or None to auto-detect)."""
+    dtype: str | None = None
+    """Precision for training ('bf16', 'fp32', or None to auto-select bf16 on cuda, fp32 otherwise)."""
 
     # model params
-    image_size: int = 128
+    image_size: int = 224
     in_channels: int = 3
     action_dim: int = 2
-    patch_size: int = 16
+    patch_size: int = 14
     hidden_dim: int = 192
     enc_depth: int = 12
     pred_depth: int = 6
     n_heads: int = 3
     mlp_ratio: int = 4
-    enc_dropout: float = 0.0
-    enc_mlp_dropout: float = 0.0
     enc_proj_hidden_dim: int = 2048
     pred_dropout: float = 0.0
-    pred_mlp_dropout: float = 0.0
+    pred_mlp_dropout: float = 0.1
     pred_mlp_dim: int = 2048
     pred_proj_hidden_dim: int = 2048
 
     # training params
     batch_size: int = 128
     num_epochs: int = 10
-    lr: float = 1e-4
-    weight_decay: float = 1e-2
+    lr: float = 5e-5
+    weight_decay: float = 1e-3
     seed: int = 42
+    frameskip: int = 5
     num_frames: int = 4
     sigreg_weight: float = 0.1
 
@@ -68,14 +77,18 @@ class TrainConfig:
 
 
 def main(config: TrainConfig):
-    # TODO: set dtype to bf16 for cuda, fp16/fp32 for mps or cpu
-    device = _configure_device()
+    device = _configure_device(config.device)
+    dtype = _configure_dtype(device, config.dtype)
     _set_seed(config.seed)
 
     run_dir = Path(config.exp_dir) / config.run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir = run_dir / config.save_dir
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # update action dim to account for frameskip
+    # TODO: there might be a better way to do this
+    config.action_dim = config.action_dim * config.frameskip
 
     logger = Logger(
         project=config.wandb_project,
@@ -90,6 +103,7 @@ def main(config: TrainConfig):
         data_path=config.data_path,
         batch_size=config.batch_size,
         num_frames=config.num_frames,
+        frameskip=config.frameskip,
         val_ratio=config.val_ratio,
         image_size=config.image_size,
         num_workers=config.num_workers,
@@ -105,6 +119,7 @@ def main(config: TrainConfig):
         in_channels=config.in_channels,
         action_dim=config.action_dim,
         patch_size=config.patch_size,
+        num_frames=config.num_frames,
         enc_depth=config.enc_depth,
         hidden_dim=config.hidden_dim,
         n_heads=config.n_heads,
@@ -112,18 +127,15 @@ def main(config: TrainConfig):
         mlp_ratio=config.mlp_ratio,
         pred_depth=config.pred_depth,
         pred_proj_hidden_dim=config.pred_proj_hidden_dim,
-        # TODO: add an mlp dim variable
         pred_mlp_dim=config.pred_mlp_dim,
-        dropout=config.dropout,
-        mlp_dropout=config.mlp_dropout,
     )
     model.to(device)
     sigreg = SIGReg(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-    # TODO: add hardware metrics
     logger.log({
         "device": str(device),
+        "dtype": str(dtype),
         "train_size": len(trainloader),
         "val_size": len(valloader),
         "parameters": sum(p.numel() for p in model.parameters()),
@@ -170,15 +182,27 @@ def main(config: TrainConfig):
             frames = batch["frames"].to(device, non_blocking=True)
             actions = batch["actions"].to(device, non_blocking=True)
 
-            # preds (B, T-1, D) | embs (B, T, D)
-            preds, embs = model(frames, actions)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=dtype,
+                enabled=(device.type == "cuda" and dtype == torch.bfloat16),
+            ):
+                # preds (B, T-1, D) | embs (B, T, D)
+                preds, embs = model(frames, actions)
 
-            prediction_loss = nn.functional.mse_loss(preds, embs[:, 1:])
-            sigreg_loss = sigreg(embs)
-            total_loss = prediction_loss + config.sigreg_weight * sigreg_loss
+                prediction_loss = nn.functional.mse_loss(preds, embs[:, 1:])
+
+                # permute to (T, B, D) for sigreg
+                temporal_embs = embs.transpose(0, 1)
+                sigreg_loss = sigreg(temporal_embs)
+
+                total_loss = prediction_loss + config.sigreg_weight * sigreg_loss
 
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if not torch.isfinite(grad_norm).item():
+                raise FloatingPointError("Training produced a non-finite gradient norm")
+
             optimizer.step()
             optimizer.zero_grad()
 
@@ -206,6 +230,7 @@ def main(config: TrainConfig):
                     "train_loss/sigreg_loss": running_sigreg_loss / running_steps,
                     "train/lr": optimizer.param_groups[0]["lr"],
                     "train/epoch": epoch,
+                    "train/grad_norm": grad_norm,
                 }
                 logger.log(step_metrics, step=optimizer_step)
                 running_total_loss = 0.0
@@ -222,6 +247,7 @@ def main(config: TrainConfig):
                 sigreg=sigreg,
                 config=config,
                 device=device,
+                dtype=dtype,
             )
             logger.log(val_metrics, step=optimizer_step)
             print(
@@ -238,19 +264,9 @@ def main(config: TrainConfig):
                 epoch=epoch,
                 step=optimizer_step,
                 save_dir=checkpoint_dir,
+                config=asdict(config),
             )
             print(f"[checkpoint] Saved epoch {epoch} to {saved_path}")
-
-    # Final validation evaluation
-    final_val_metrics = validate(
-        model=model,
-        dataloader=valloader,
-        sigreg=sigreg,
-        config=config,
-        device=device,
-    )
-    logger.log(final_val_metrics, step=optimizer_step)
-    print(f"[eval][final] total_loss={final_val_metrics['val_loss/total']:.4f}")
 
     # Save final checkpoint and summary metrics
     saved_path = save_checkpoint(
@@ -260,6 +276,7 @@ def main(config: TrainConfig):
         step=optimizer_step,
         save_dir=checkpoint_dir,
         filename="checkpoint_final.pt",
+        config=asdict(config),
     )
     print(f"[checkpoint] Saved final model to {saved_path}")
     elapsed = max(1e-6, time.perf_counter() - train_start)
@@ -276,13 +293,14 @@ def main(config: TrainConfig):
     summary = {
         "run_id": config.run_id,
         "device": str(device),
+        "dtype": str(dtype),
         "parameters": sum(p.numel() for p in model.parameters()),
         "train_size": len(trainloader),
         "val_size": len(valloader),
         "optimizer_steps_completed": optimizer_step,
         "elapsed_seconds": elapsed,
         "optimizer_steps_ps": float(optimizer_step / elapsed),
-        "final_val_loss": final_val_metrics.get("val_loss/total", None),
+        "final_val_loss": val_metrics.get("val_loss/total", None),
     }
     (run_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"

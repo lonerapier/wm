@@ -33,8 +33,8 @@ class TransformerBlock(nn.Module):
         )
 
     def forward(self, x):
-        x = self.norm1(x)
-        attn_output, _ = self.attn(x, x, x, attn_mask=None, need_weights=False)
+        x_norm = self.norm1(x)
+        attn_output, _ = self.attn(x_norm, x_norm, x_norm, attn_mask=None, need_weights=False)
         x = x + attn_output
         x = x + self.mlp(self.norm2(x))
         return x
@@ -76,11 +76,13 @@ class ConditionalTransformerBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(
             action_emb
         ).chunk(6, dim=-1)
-        x = modulate(self.norm1(x), shift_msa, scale_msa)
+        x_norm = modulate(self.norm1(x), shift_msa, scale_msa)
         causal_mask = torch.triu(
             torch.ones(x.shape[1], x.shape[1], device=x.device, dtype=torch.bool), diagonal=1
         )
-        attn_output, _ = self.attn(x, x, x, attn_mask=causal_mask, need_weights=False)
+        attn_output, _ = self.attn(
+            x_norm, x_norm, x_norm, attn_mask=causal_mask, need_weights=False
+        )
         x = x + gate_msa * attn_output
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
@@ -90,14 +92,12 @@ class Encoder(nn.Module):
     def __init__(
         self,
         image_size: tuple[int, int] = (224, 224),
-        patch_size: int = 16,
+        patch_size: int = 14,
         in_channels: int = 3,
         hidden_dim: int = 192,
         depth: int = 12,
         n_heads: int = 3,
         mlp_ratio: int = 4,
-        dropout: float = 0.0,
-        mlp_dropout: float = 0.0,
     ):
         super().__init__()
         if isinstance(image_size, int):
@@ -115,8 +115,6 @@ class Encoder(nn.Module):
                 hidden_dim,
                 mlp_ratio,
                 n_heads,
-                dropout,
-                mlp_dropout,
             )
             for _ in range(depth)
         ])
@@ -144,8 +142,8 @@ class Predictor(nn.Module):
         depth: int = 6,
         n_heads: int = 3,
         mlp_dim: int = 2048,
-        dropout: float = 0.1,
-        mlp_dropout: float = 0.0,
+        dropout: float = 0.0,
+        emb_dropout: float = 0.0,
     ):
         super().__init__()
         self.pos_embed = nn.Parameter(torch.randn(1, num_frames, hidden_dim))
@@ -155,11 +153,10 @@ class Predictor(nn.Module):
                 mlp_dim,
                 n_heads,
                 dropout,
-                mlp_dropout,
             )
             for _ in range(depth)
         ])
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(emb_dropout)
         self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, x_emb: torch.Tensor, action_emb: torch.Tensor):
