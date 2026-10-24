@@ -53,6 +53,7 @@ class LeWMDataset(Dataset):
         h5_file_path: str,
         split: str = "train",
         num_frames: int = 4,
+        frameskip: int = 5,
         val_ratio: float = 0.1,
         seed: int = 42,
         image_size: int | tuple[int, int] | None = None,
@@ -61,6 +62,8 @@ class LeWMDataset(Dataset):
         self.data: h5py.File | None = None
         self.split = split
         self.num_frames = num_frames
+        self.frameskip = frameskip
+        self.span = self.num_frames * frameskip
         self.image_size = (image_size, image_size) if isinstance(image_size, int) else image_size
         self.normalizer = normalizer
 
@@ -96,8 +99,12 @@ class LeWMDataset(Dataset):
         for ep in selected_eps:
             offset = int(ep_offsets[ep])
             length = int(ep_lens[ep])
-            if length >= num_frames:
-                starts.append(np.arange(offset, offset + length - num_frames + 1, dtype=np.int64))
+            if length >= self.span:
+                starts.append(np.arange(offset, offset + length - self.span + 1, dtype=np.int64))
+            else:
+                raise ValueError(
+                    f"Episode {ep} is too short for span {self.span}, length: {length}"
+                )
 
         self.valid_starts = np.concatenate(starts) if starts else np.empty(0, dtype=np.int64)
 
@@ -114,7 +121,7 @@ class LeWMDataset(Dataset):
 
     @property
     def action_dim(self) -> int:
-        return self._action_dim
+        return self._action_dim * self.frameskip
 
     @property
     def obs_dim(self) -> int | None:
@@ -132,10 +139,10 @@ class LeWMDataset(Dataset):
         data = self._get_data()
 
         start = self.valid_starts[idx]
-        end = start + self.num_frames
+        end = start + self.span
 
         # Pixels: (num_frames, H, W, C) uint8 -> (num_frames, C, H, W) float in [0, 1]
-        raw_pixels = data["pixels"][start:end]
+        raw_pixels = data["pixels"][start : end : self.frameskip]
         pixels = torch.from_numpy(raw_pixels).float().permute(0, 3, 1, 2) / 255.0
 
         # reshape raw images
@@ -148,7 +155,8 @@ class LeWMDataset(Dataset):
         raw_actions = data["action"][start:end]
         if self.normalizer is not None:
             raw_actions = self.normalizer.normalize_action(raw_actions)
-        actions = torch.from_numpy(raw_actions).float()
+        raw_actions = raw_actions.reshape(self.num_frames, -1)
+        actions = torch.from_numpy(raw_actions).float().nan_to_num(0.0)
 
         item = {
             "frames": pixels,
@@ -169,6 +177,7 @@ def build_dataloaders(
     data_path: str,
     batch_size: int,
     num_frames: int = 4,
+    frameskip: int = 5,
     val_ratio: float = 0.1,
     image_size: int | tuple[int, int] | None = None,
     num_workers: int = 0,
@@ -181,6 +190,7 @@ def build_dataloaders(
         h5_file_path=data_path,
         split="train",
         num_frames=num_frames,
+        frameskip=frameskip,
         val_ratio=val_ratio,
         seed=seed,
         image_size=image_size,
@@ -190,6 +200,7 @@ def build_dataloaders(
         h5_file_path=data_path,
         split="val",
         num_frames=num_frames,
+        frameskip=frameskip,
         val_ratio=val_ratio,
         seed=seed,
         image_size=image_size,

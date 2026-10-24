@@ -36,9 +36,6 @@ DATASET_REGISTRY: dict[str, dict[str, Any]] = {
 }
 
 # Aliases
-DATASET_REGISTRY["cube"] = DATASET_REGISTRY["ogbench-cube"]
-DATASET_REGISTRY["ogbench"] = DATASET_REGISTRY["ogbench-cube"]
-
 AVAILABLE_DATASETS = list(DATASET_REGISTRY.keys())
 
 
