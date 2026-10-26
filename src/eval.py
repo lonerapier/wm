@@ -42,7 +42,8 @@ def validate(
     total_emb_std = 0.0
 
     num_batches = 0
-    sigreg_weight = getattr(config, "sigreg_weight", 0.1)
+    target_size = getattr(config, "image_size", None)
+    target_size = (target_size, target_size) if isinstance(target_size, int) else target_size
 
     for batch in dataloader:
         frames = batch["frames"].to(device, non_blocking=True)
@@ -59,7 +60,7 @@ def validate(
             pred_loss = nn.functional.mse_loss(preds, targets)
             temporal_embs = embs.transpose(0, 1)
             sr_loss = sigreg(temporal_embs)
-            batch_total_loss = pred_loss + sigreg_weight * sr_loss
+            batch_total_loss = pred_loss + config.sigreg_weight * sr_loss
 
             l1_err = nn.functional.l1_loss(preds, targets)
             cos_sim = nn.functional.cosine_similarity(preds, targets, dim=-1).mean()

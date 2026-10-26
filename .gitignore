@@ -14,3 +14,9 @@ data/
 
 # Experiments
 exp/
+wandb/
+
+# Environment variables & secrets
+.env
+.env.*
+!.env.example

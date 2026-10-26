@@ -58,6 +58,7 @@ class LeWMDataset(Dataset):
         seed: int = 42,
         image_size: int | tuple[int, int] | None = None,
         normalizer: Normalizer | None = None,
+        return_uint8: bool = False,
     ):
         self.data: h5py.File | None = None
         self.split = split
@@ -66,6 +67,7 @@ class LeWMDataset(Dataset):
         self.span = self.num_frames * frameskip
         self.image_size = (image_size, image_size) if isinstance(image_size, int) else image_size
         self.normalizer = normalizer
+        self.return_uint8 = return_uint8
 
         self.h5_file_path = self._resolve_path(h5_file_path)
 
@@ -129,7 +131,13 @@ class LeWMDataset(Dataset):
 
     def _get_data(self) -> h5py.File:
         if self.data is None:
-            self.data = h5py.File(self.h5_file_path, "r", swmr=True)
+            self.data = h5py.File(
+                self.h5_file_path,
+                "r",
+                swmr=True,
+                rdcc_nbytes=64 * 1024 * 1024,
+                rdcc_nslots=50000,
+            )
         return self.data
 
     def __len__(self) -> int:
@@ -141,15 +149,21 @@ class LeWMDataset(Dataset):
         start = self.valid_starts[idx]
         end = start + self.span
 
-        # Pixels: (num_frames, H, W, C) uint8 -> (num_frames, C, H, W) float in [0, 1]
-        raw_pixels = data["pixels"][start : end : self.frameskip]
-        pixels = torch.from_numpy(raw_pixels).float().permute(0, 3, 1, 2) / 255.0
+        # Contiguous HDF5 read: reading [start:end] in one hyperslab is much faster than strided slicing
+        raw_slice = data["pixels"][start:end]
+        raw_pixels = raw_slice[:: self.frameskip]
 
-        # reshape raw images
-        if self.image_size is not None and pixels.shape[-2:] != self.image_size:
-            pixels = F.interpolate(
-                pixels, size=self.image_size, mode="bilinear", align_corners=False
-            )
+        # TODO: remove `return_uint6` after testing
+        if getattr(self, "return_uint8", False):
+            # Return uint8 (T, C, H, W) for fast IPC transfer; normalization and resize done on GPU
+            pixels = torch.from_numpy(raw_pixels).permute(0, 3, 1, 2)
+        else:
+            # Legacy/default: float in [0, 1] resized on CPU
+            pixels = torch.from_numpy(raw_pixels).float().permute(0, 3, 1, 2) / 255.0
+            if self.image_size is not None and pixels.shape[-2:] != self.image_size:
+                pixels = F.interpolate(
+                    pixels, size=self.image_size, mode="bilinear", align_corners=False
+                )
 
         # Actions: (num_frames, action_dim)
         raw_actions = data["action"][start:end]
@@ -184,6 +198,7 @@ def build_dataloaders(
     seed: int = 42,
     pin_memory: bool = True,
     normalizer: Normalizer | None = None,
+    return_uint8: bool = False,
 ) -> tuple[DataLoader, DataLoader]:
     """Create train and validation DataLoaders with episode-level splits."""
     train_dataset = LeWMDataset(
@@ -195,6 +210,7 @@ def build_dataloaders(
         seed=seed,
         image_size=image_size,
         normalizer=normalizer,
+        return_uint8=return_uint8,
     )
     val_dataset = LeWMDataset(
         h5_file_path=data_path,
@@ -205,6 +221,7 @@ def build_dataloaders(
         seed=seed,
         image_size=image_size,
         normalizer=normalizer,
+        return_uint8=return_uint8,
     )
 
     train_loader = DataLoader(
@@ -214,6 +231,8 @@ def build_dataloaders(
         num_workers=num_workers,
         pin_memory=pin_memory and torch.cuda.is_available(),
         drop_last=True,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=2 if num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -222,6 +241,8 @@ def build_dataloaders(
         num_workers=num_workers,
         pin_memory=pin_memory and torch.cuda.is_available(),
         drop_last=False,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=2 if num_workers > 0 else None,
     )
 
     return train_loader, val_loader
