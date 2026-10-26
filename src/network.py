@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 
@@ -7,6 +8,30 @@ from torch import nn
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
     return x * (1 + scale) + shift
+
+
+class Attention(nn.Module):
+    def __init__(self, dim: int, n_heads: int, dropout: float = 0.0):
+        super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+        self.qkv = nn.Linear(dim, dim * 3, bias=True)
+        self.proj = nn.Linear(dim, dim)
+        self.dropout = dropout
+
+    def forward(self, x: torch.Tensor, is_causal: bool = False):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=is_causal,
+        )
+        out = out.transpose(1, 2).reshape(B, N, C)
+        return self.proj(out)
 
 
 class TransformerBlock(nn.Module):
@@ -21,9 +46,7 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=hidden_dim, num_heads=n_heads, dropout=dropout, batch_first=True
-        )
+        self.attn = Attention(hidden_dim, n_heads, dropout)
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * mlp_ratio),
             nn.GELU(),
@@ -34,7 +57,7 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x):
         x_norm = self.norm1(x)
-        attn_output, _ = self.attn(x_norm, x_norm, x_norm, attn_mask=None, need_weights=False)
+        attn_output = self.attn(x_norm, is_causal=False)
         x = x + attn_output
         x = x + self.mlp(self.norm2(x))
         return x
@@ -50,9 +73,7 @@ class ConditionalTransformerBlock(nn.Module):
         mlp_dropout: float = 0.0,
     ):
         super().__init__()
-        self.attn = nn.MultiheadAttention(
-            embed_dim=hidden_dim, num_heads=n_heads, dropout=dropout, batch_first=True
-        )
+        self.attn = Attention(hidden_dim, n_heads, dropout)
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, mlp_dim),
             nn.GELU(),
@@ -77,12 +98,7 @@ class ConditionalTransformerBlock(nn.Module):
             action_emb
         ).chunk(6, dim=-1)
         x_norm = modulate(self.norm1(x), shift_msa, scale_msa)
-        causal_mask = torch.triu(
-            torch.ones(x.shape[1], x.shape[1], device=x.device, dtype=torch.bool), diagonal=1
-        )
-        attn_output, _ = self.attn(
-            x_norm, x_norm, x_norm, attn_mask=causal_mask, need_weights=False
-        )
+        attn_output = self.attn(x_norm, is_causal=True)
         x = x + gate_msa * attn_output
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x

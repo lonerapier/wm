@@ -3143,7 +3143,7 @@ requires-dist = [
     { name = "ogbench", specifier = ">=1.2.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "python-dotenv", specifier = ">=1.2.4" },
-    { name = "torch", specifier = ">=2.4.0" },
+    { name = "torch", specifier = ">=2.14.0" },
     { name = "tqdm", specifier = ">=4.70.1" },
     { name = "transformers", specifier = ">=5.20.2" },
     { name = "tyro", specifier = ">=1.0.16" },

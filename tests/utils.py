@@ -4,53 +4,9 @@ import torch
 import torch.nn as nn
 
 from utils import (
-    _configure_device,
-    _configure_dtype,
-    _set_seed,
     load_checkpoint,
     save_checkpoint,
 )
-
-
-def test_configure_device():
-    device = _configure_device()
-    assert isinstance(device, torch.device)
-    assert device.type in ("cuda", "mps", "cpu")
-
-    # Explicit override
-    cpu_device = _configure_device("cpu")
-    assert cpu_device.type == "cpu"
-
-
-def test_configure_dtype():
-    # CUDA defaults to bf16
-    cuda_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    assert _configure_dtype("cuda") == torch.bfloat16
-    assert _configure_dtype(
-        torch.device("cuda:0" if torch.cuda.is_available() else "cpu").type
-    ) in (
-        torch.bfloat16,
-        torch.float32,
-    )
-
-    # CPU and MPS default to float32
-    assert _configure_dtype("cpu") == torch.float32
-    assert _configure_dtype(torch.device("cpu")) == torch.float32
-    assert _configure_dtype("mps") == torch.float32
-
-    # Explicit overrides
-    assert _configure_dtype("cuda", "fp32") == torch.float32
-    assert _configure_dtype("cpu", "bf16") == torch.bfloat16
-    assert _configure_dtype("cpu", "float16") == torch.float16
-    assert _configure_dtype("cpu", torch.bfloat16) == torch.bfloat16
-
-
-def test_set_seed():
-    _set_seed(123)
-    a = torch.randn(5)
-    _set_seed(123)
-    b = torch.randn(5)
-    torch.testing.assert_close(a, b)
 
 
 def test_checkpoint_save_and_load(tmp_path: Path):

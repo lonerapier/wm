@@ -152,16 +152,36 @@ def _set_seed(seed: int) -> None:
 
 
 def _configure_device(device: Optional[str | torch.device] = None) -> torch.device:
-    if device is not None:
-        return torch.device(device)
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "mps"
-        if torch.backends.mps.is_available()
-        else "cpu"
+    target_device = (
+        torch.device(device)
+        if device is not None
+        else torch.device(
+            "cuda"
+            if torch.cuda.is_available()
+            else "mps"
+            if torch.backends.mps.is_available()
+            else "cpu"
+        )
     )
-    return device
+
+    if target_device.type == "cuda":
+        # Modern PyTorch API for controlling internal float32 precision
+        if hasattr(torch.backends.cuda.matmul, "fp32_precision"):
+            torch.backends.cuda.matmul.fp32_precision = "tf32"
+        elif hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
+
+        if (
+            hasattr(torch.backends, "cudnn")
+            and hasattr(torch.backends.cudnn, "conv")
+            and hasattr(torch.backends.cudnn.conv, "fp32_precision")
+        ):
+            torch.backends.cudnn.conv.fp32_precision = "tf32"
+
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.benchmark = True
+
+    return target_device
 
 
 def _configure_dtype(

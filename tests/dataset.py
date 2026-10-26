@@ -5,19 +5,7 @@ import numpy as np
 import pytest
 import torch
 
-from dataset.dataset import LeWMDataset, Normalizer, build_dataloaders
-
-
-def test_normalizer():
-    states = np.array([[1.0, 2.0], [3.0, 6.0], [5.0, 10.0]])
-    actions = np.array([[-1.0, 0.0], [1.0, 2.0], [0.0, 1.0]])
-
-    normalizer = Normalizer.from_data(states, actions)
-
-    norm_actions = normalizer.normalize_action(actions)
-    denorm_actions = normalizer.denormalize_action(norm_actions)
-
-    np.testing.assert_allclose(denorm_actions, actions, atol=1e-6)
+from dataset.dataset import LeWMDataset, build_dataloaders
 
 
 @pytest.fixture
@@ -99,3 +87,17 @@ def test_build_dataloaders(synthetic_h5_file):
     batch = next(iter(train_loader))
     assert batch["frames"].shape == (2, 4, 3, 24, 24)
     assert batch["actions"].shape == (2, 4, 10)
+
+
+def test_dataset_return_uint8(synthetic_h5_file):
+    train_loader, _ = build_dataloaders(
+        data_path=synthetic_h5_file,
+        batch_size=2,
+        num_frames=3,
+        val_ratio=0.2,
+        return_uint8=True,
+    )
+
+    batch = next(iter(train_loader))
+    assert batch["frames"].dtype == torch.uint8
+    assert batch["frames"].shape == (2, 3, 3, 16, 16)

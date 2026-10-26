@@ -187,7 +187,16 @@ def main(config: TrainConfig):
     model.to(device)
     sigreg = SIGReg(device)
 
-    optimizer = optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    if device.type == "cuda":
+        model = torch.compile(model)
+        sigreg = torch.compile(sigreg)
+
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=config.lr,
+        weight_decay=config.weight_decay,
+        fused=(device.type == "cuda"),
+    )
     logger.log({
         "device": str(device),
         "dtype": str(dtype),
@@ -253,30 +262,30 @@ def main(config: TrainConfig):
                 raise FloatingPointError("Training produced a non-finite gradient norm")
 
             optimizer.step()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
             optimizer_step += 1
 
-            total_item = total_loss.item()
-            pred_item = prediction_loss.item()
-            sigreg_item = sigreg_loss.item()
-
-            running_total_loss += total_item
-            running_pred_loss += pred_item
-            running_sigreg_loss += sigreg_item
+            running_total_loss += total_loss.detach()
+            running_pred_loss += prediction_loss.detach()
+            running_sigreg_loss += sigreg_loss.detach()
             running_steps += 1
 
-            avg_total_loss = running_total_loss / running_steps
-            progress.set_postfix(
-                loss=f"{total_item:.4f}",
-                avg_loss=f"{avg_total_loss:.4f}",
-            )
-
             if optimizer_step % config.log_interval == 0 and running_steps > 0:
+                avg_total_loss = (running_total_loss / running_steps).item()
+                avg_pred_loss = (running_pred_loss / running_steps).item()
+                avg_sigreg_loss = (running_sigreg_loss / running_steps).item()
+
+                progress.set_postfix(
+                    total_loss=f"{avg_total_loss:.4f}",
+                    pred_loss=f"{avg_pred_loss:.4f}",
+                    sigreg_loss=f"{avg_sigreg_loss:.4f}",
+                )
+
                 step_metrics = {
-                    "train_loss/total": running_total_loss / running_steps,
-                    "train_loss/prediction_loss": running_pred_loss / running_steps,
-                    "train_loss/sigreg_loss": running_sigreg_loss / running_steps,
+                    "train_loss/total": avg_total_loss,
+                    "train_loss/prediction_loss": avg_pred_loss,
+                    "train_loss/sigreg_loss": avg_sigreg_loss,
                     "train/lr": optimizer.param_groups[0]["lr"],
                     "train/epoch": epoch,
                     "train/grad_norm": grad_norm,
