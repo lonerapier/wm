@@ -20,13 +20,15 @@
 
 ### Implementation details
 **Encoder**: maps a given frame $o_t$ into compact low-dimensional representation $z_t$
-- $z_t=\text{enc}_{\theta}(o_t)$
+$$z_t=\text{enc}_{\theta}(o_t)$$
+
 - ViT-Tiny — patch size 14, 12 layers, 3 attention heads, hidden dim 192
 - Observation embedding $z_t$ is constructed from the $\texttt{[CLS]}$ token embedding of last layer.
 - Projection step maps $\texttt{[CLS]}$ token embedding into new represenation space using 1-layer MLP with *BatchNorm*. 
 
 **Predictor**: autoregressively predicts the representation of next frame $\hat{z}_{t+1}$ given latent embedding $z_t$ and action $a_t$
-- $\hat{z}_{t+1}=\text{pred}_{\phi}(z_t,a_t)$
+$$\hat{z}_{t+1}=\text{pred}_{\phi}(z_t,a_t)$$
+
 - Action-conditioned which means predicting next representation requires action taken.
 - Takes as input history of $N$ frames representations and predicts the next frame representation.
 - ViT-Small — 6 layers, 16 causal attention heads, 10% dropout. Actions added through AdaLN at each layer. 
@@ -53,19 +55,26 @@
 
 ### Objective 
 
-$$\mathcal{L}_{\text{LeWM}}=\mathcal{L}_{\text{pred}}+\lambda\text{SIGReg}(Z)$$
+$$
+\begin{aligned}
+\mathcal{L}_{\text{LeWM}}&=\mathcal{L}_{\text{pred}}+\lambda\text{SIGReg}(Z) \\
+\mathcal{L}_{\text{pred}}&=\|z_{t+1} - \hat{z}_{t+1}\|_2^2 & (\text{Teacher-forcing loss})\\
+\text{SIGReg}(Z)&=\frac{1}{M}\sum_{m=1}^{M}T(h^{(m)}) & (\text{Sketched-Isotropic Gaussian Regularisation})
+\end{aligned}
+$$
 
-- Teacher-forcing loss: $\mathcal{L}_{\text{pred}} = \|z_{t+1} - \hat{z}_{t+1}\|_2^2$
-- Sketched-Isotropic Gaussian Regularisation: $\text{SIGReg}(Z) = \frac{1}{M}\sum_{m=1}^{M}T(h^{(m)})$
+Where $z$ is the actual latent representation of the next frame, $\hat{z}$ is the predicted latent representation of the next frame. $\lambda$ is the weight for SIGReg. $M$ is the batch size. $T(h^{(m)})$ is the sketched-isotropic Gaussian regularisation term.
 
-> [!NOTE] Why is SIGReg necessary?
+> [!NOTE] 
+> Why is SIGReg necessary?
 > Without SIGReg, LeWM predicts constant embedding $\text{enc}_{\theta}(x)=c$ which minimises the loss to zero exactly, leading to collapse. To prevent this, they add an anti-collapse regularisation term that promotes feature diversity in the embedding space.
 
 ### SIGReg
 
 SIGReg penalises the representation when it's trivial (concentrated, low-rank or low-variance) by encouraging the latent representation to match an isotropic Gaussian target distribution. Regulariser term is given by $\text{SIGReg}(Z)$, where $Z=\set{z_1,z_2,\dots,z_{N}}$ are batch of embeddings.
 
-> [!WARNING] write more about sigreg.
+> [!WARNING] 
+> write more about sigreg.
 
 ### Planning
 
@@ -78,7 +87,7 @@ where $z_g$ is the goal embedding, can be extracted using encoder from goal imag
 At inference time, planning correspond to finite-horizon optimal control problem, 
 
 $$
-a_{1:H}^{*}=\argmin_{a_{1:H}} \mathcal{L}_{\text{plan}}(\hat{z}_H)
+a_{1:H}^{*}=\arg\min_{a_{1:H}} \mathcal{L}_{\text{plan}}(\hat{z}_H)
 $$
 
 which is solved using CEM. Autoregressive rollout accumulates prediction errors (growing quadratically with Horizon), deteriorating quality of action sequence. LeWM extenuates this by using *Model-Predictive Control (MPC)*, executing only the first $K$ planned actions before replanning using next state-observation.
