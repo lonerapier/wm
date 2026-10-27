@@ -1,0 +1,38 @@
+# ==============================================================================
+# Custom Pre-baked Docker Image for Vast.ai Instant Startup
+# ==============================================================================
+# Usage:
+#   docker build -t your_dockerhub_user/wm:latest -f Dockerfile.vast .
+#   docker push your_dockerhub_user/wm:latest
+#
+# Then create a Vast.ai template with your image:
+#   uv run scripts/vast_manage.py create-template --name "wm-trainer" --image "your_dockerhub_user/wm:latest"
+# ==============================================================================
+
+FROM pytorch/pytorch:2.14.1-cuda12.6-cudnn9-devel
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PATH="/root/.local/bin:/root/.cargo/bin:$PATH"
+
+# Install system dependencies for Mujoco/OpenGL rendering and utilities
+RUN apt-get update -y -q && apt-get install -y -q --no-install-recommends \
+    git curl wget tmux htop rsync \
+    libgl1-mesa-glx libosmesa6-dev libglew-dev patchelf \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv for fast CLI / runtime management on Vast.ai
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+
+WORKDIR /workspace/wm
+
+# Pre-install dependencies and project
+COPY pyproject.toml README.md ./
+COPY src ./src
+RUN pip install --no-cache-dir -e .
+
+# Copy remaining repository files (scripts, configs, tests)
+COPY . .
+
+CMD ["bash"]
