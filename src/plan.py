@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 
 from dataset.dataset import build_dataloaders
 from jepa import JEPA
-from utils import _configure_device, _configure_dtype, _set_seed
+from utils import _configure_device, _configure_dtype, _set_seed, prepare_batch
 
 
 @dataclass
@@ -203,8 +203,8 @@ def plan(
     # TODO: run on specifc obs indices
 
     for batch in valloader:
-        frames = batch["frames"].to(device, non_blocking=True)
-        actions = batch["actions"].to(device, non_blocking=True)
+        image_size = getattr(model.encoder, "image_size", None)
+        frames, actions = prepare_batch(batch, device=device, image_size=image_size)
 
         B, T = frames.shape[:2]
         print(frames.shape, actions.shape)

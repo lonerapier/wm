@@ -3,7 +3,6 @@ from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 import tyro
 from torch import nn, optim
 from tqdm import tqdm
@@ -17,30 +16,10 @@ from utils import (
     _configure_dtype,
     _set_seed,
     load_checkpoint,
+    prepare_batch,
     save_checkpoint,
     save_run_summary,
 )
-
-
-def prepare_batch(
-    batch: dict[str, torch.Tensor],
-    device: torch.device,
-    image_size: int | tuple[int, int] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Transfer batch to device and perform GPU-accelerated float/resize transforms."""
-    frames = batch["frames"].to(device, non_blocking=True)
-    actions = batch["actions"].to(device, non_blocking=True)
-
-    if frames.dtype == torch.uint8:
-        target_size = (image_size, image_size) if isinstance(image_size, int) else image_size
-        B, T, C, H, W = frames.shape
-        frames = frames.view(B * T, C, H, W).float().div_(255.0)
-        if target_size is not None and (H, W) != target_size:
-            frames = F.interpolate(frames, size=target_size, mode="bilinear", align_corners=False)
-        target_h, target_w = target_size if target_size else (H, W)
-        frames = frames.view(B, T, C, target_h, target_w)
-
-    return frames, actions
 
 
 @dataclass
@@ -58,11 +37,11 @@ class TrainConfig:
     """Directory to save checkpoints."""
     resume_from: str | None = None
     """Path or filename to resume training from (searches locally and in Hugging Face)."""
-    eval_interval: int = 5
+    eval_interval: int = 2
     """Evaluate every `eval_interval` epochs."""
     log_interval: int = 10
     """Log every `log_interval` steps."""
-    save_interval: int = 5
+    save_interval: int = 2
     """Save every `save_interval` epochs."""
     device: str | None = None
     """Device to use for training ('cuda', 'mps', 'cpu', or None to auto-detect)."""
@@ -124,7 +103,7 @@ class TrainConfig:
     """Path to the dataset."""
     val_ratio: float = 0.1
     """Fraction of data to use for validation."""
-    num_workers: int = 4
+    num_workers: int = 8
     """Number of workers for dataloader."""
 
 
@@ -238,7 +217,9 @@ def main(config: TrainConfig):
         running_steps = 0
 
         for batch in progress:
-            frames, actions = prepare_batch(batch, device=device, image_size=config.image_size)
+            frames, actions = prepare_batch(
+                batch, device=device, image_size=config.image_size, dtype=dtype
+            )
 
             with torch.autocast(
                 device_type=device.type,

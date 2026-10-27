@@ -5,6 +5,8 @@ from typing import Any, Dict, Optional
 import torch
 from torch import nn
 
+from utils import prepare_batch
+
 
 @torch.no_grad()
 def validate(
@@ -46,8 +48,7 @@ def validate(
     target_size = (target_size, target_size) if isinstance(target_size, int) else target_size
 
     for batch in dataloader:
-        frames = batch["frames"].to(device, non_blocking=True)
-        actions = batch["actions"].to(device, non_blocking=True)
+        frames, actions = prepare_batch(batch, device=device, image_size=target_size)
 
         with torch.autocast(
             device_type=device.type,

@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import torch
+import torch.nn.functional as F
 
 try:
     from dotenv import load_dotenv
@@ -73,7 +74,6 @@ def save_checkpoint(
     return path
 
 
-
 def load_checkpoint(
     checkpoint_path: str | Path,
     model: torch.nn.Module,
@@ -106,11 +106,15 @@ def load_checkpoint(
                     if clean_target in ("latest", "last"):
                         downloaded = manager.get_latest_checkpoint(target_run_id, target_dir)
                     else:
-                        downloaded = manager.download_checkpoint(target_run_id, clean_target, target_dir)
+                        downloaded = manager.download_checkpoint(
+                            target_run_id, clean_target, target_dir
+                        )
                     if downloaded and downloaded.is_file():
                         ckpt_path = downloaded
                 except Exception as e:
-                    raise FileNotFoundError(f"Checkpoint not found locally or on Hugging Face: {e}") from e
+                    raise FileNotFoundError(
+                        f"Checkpoint not found locally or on Hugging Face: {e}"
+                    ) from e
 
         if not ckpt_path.is_file():
             raise FileNotFoundError(f"Checkpoint file not found at '{checkpoint_path}'")
@@ -208,3 +212,25 @@ def _configure_dtype(
     if device_type == "cuda":
         return torch.bfloat16
     return torch.float32
+
+
+def prepare_batch(
+    batch: dict[str, torch.Tensor],
+    device: torch.device,
+    image_size: int | tuple[int, int] | None = None,
+    dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Transfer batch to device and perform GPU-accelerated float/resize transforms."""
+    frames = batch["frames"].to(device, non_blocking=True)
+    actions = batch["actions"].to(device, non_blocking=True)
+
+    if frames.dtype == torch.uint8:
+        target_size = (image_size, image_size) if isinstance(image_size, int) else image_size
+        B, T, C, H, W = frames.shape
+        frames = frames.view(B * T, C, H, W).to(dtype=dtype).div_(255.0)
+        if target_size is not None and (H, W) != target_size:
+            frames = F.interpolate(frames, size=target_size, mode="bilinear", align_corners=False)
+        target_h, target_w = target_size if target_size else (H, W)
+        frames = frames.view(B, T, C, target_h, target_w)
+
+    return frames, actions

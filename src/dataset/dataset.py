@@ -135,8 +135,8 @@ class LeWMDataset(Dataset):
                 self.h5_file_path,
                 "r",
                 swmr=True,
-                rdcc_nbytes=64 * 1024 * 1024,
-                rdcc_nslots=50000,
+                rdcc_nbytes=256 * 1024 * 1024,
+                rdcc_nslots=100003,
             )
         return self.data
 
@@ -151,7 +151,7 @@ class LeWMDataset(Dataset):
 
         # Contiguous HDF5 read: reading [start:end] in one hyperslab is much faster than strided slicing
         raw_slice = data["pixels"][start:end]
-        raw_pixels = raw_slice[:: self.frameskip]
+        raw_pixels = np.ascontiguousarray(raw_slice[:: self.frameskip])
 
         # TODO: remove `return_uint6` after testing
         if getattr(self, "return_uint8", False):
@@ -199,6 +199,7 @@ def build_dataloaders(
     pin_memory: bool = True,
     normalizer: Normalizer | None = None,
     return_uint8: bool = False,
+    prefetch_factor: int = 4,
 ) -> tuple[DataLoader, DataLoader]:
     """Create train and validation DataLoaders with episode-level splits."""
     train_dataset = LeWMDataset(
@@ -232,7 +233,7 @@ def build_dataloaders(
         pin_memory=pin_memory and torch.cuda.is_available(),
         drop_last=True,
         persistent_workers=(num_workers > 0),
-        prefetch_factor=2 if num_workers > 0 else None,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -242,7 +243,7 @@ def build_dataloaders(
         pin_memory=pin_memory and torch.cuda.is_available(),
         drop_last=False,
         persistent_workers=(num_workers > 0),
-        prefetch_factor=2 if num_workers > 0 else None,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
 
     return train_loader, val_loader
