@@ -36,13 +36,11 @@ def synthetic_h5_file(tmp_path: Path):
 
 def test_dataset_item_shape(synthetic_h5_file):
     num_frames = 3
-    image_size = (32, 32)
     dataset = LeWMDataset(
         h5_file_path=synthetic_h5_file,
         split="train",
         num_frames=num_frames,
         val_ratio=0.2,
-        image_size=image_size,
     )
 
     assert len(dataset) > 0
@@ -51,10 +49,9 @@ def test_dataset_item_shape(synthetic_h5_file):
     assert "frames" in item
     assert "actions" in item
 
-    # frames: (num_frames, C, H, W)
-    assert item["frames"].shape == (num_frames, 3, 32, 32)
-    assert item["frames"].dtype == torch.float32
-    assert item["frames"].min() >= 0.0 and item["frames"].max() <= 1.0
+    # frames: (num_frames, C, H, W) in uint8 [0, 255]
+    assert item["frames"].shape == (num_frames, 3, 16, 16)
+    assert item["frames"].dtype == torch.uint8
 
     # actions: (num_frames, action_dim * frameskip)
     assert item["actions"].shape == (num_frames, 10)
@@ -80,22 +77,21 @@ def test_build_dataloaders(synthetic_h5_file):
         batch_size=2,
         num_frames=4,
         val_ratio=0.2,
-        image_size=24,
         num_workers=0,
     )
 
     batch = next(iter(train_loader))
-    assert batch["frames"].shape == (2, 4, 3, 24, 24)
+    assert batch["frames"].dtype == torch.uint8
+    assert batch["frames"].shape == (2, 4, 3, 16, 16)
     assert batch["actions"].shape == (2, 4, 10)
 
 
-def test_dataset_return_uint8(synthetic_h5_file):
+def test_dataset_uint8_default(synthetic_h5_file):
     train_loader, _ = build_dataloaders(
         data_path=synthetic_h5_file,
         batch_size=2,
         num_frames=3,
         val_ratio=0.2,
-        return_uint8=True,
     )
 
     batch = next(iter(train_loader))

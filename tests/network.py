@@ -3,6 +3,9 @@ import torch
 from network import (
     ActionEmbedder,
     ConditionalTransformerBlock,
+    CrossAttention,
+    CrossAttentionBlock,
+    Decoder,
     Encoder,
     Predictor,
     TransformerBlock,
@@ -78,3 +81,113 @@ def test_predictor():
 
     assert preds.shape == (B, T, D)
     assert not torch.isnan(preds).any()
+
+
+def test_cross_attention():
+    B, N_q, N_kv, D = 2, 16, 1, 64
+    attn = CrossAttention(dim=D, n_heads=4)
+    q = torch.randn(B, N_q, D)
+    kv = torch.randn(B, N_kv, D)
+    out = attn(q, kv)
+
+    assert out.shape == (B, N_q, D)
+    assert not torch.isnan(out).any()
+
+
+def test_cross_attention_block():
+    B, N_q, N_kv, D = 2, 16, 1, 64
+    block = CrossAttentionBlock(hidden_dim=D, mlp_ratio=4, n_heads=4)
+    x = torch.randn(B, N_q, D)
+    kv = torch.randn(B, N_kv, D)
+    out = block(x, kv)
+
+    assert out.shape == (B, N_q, D)
+    assert not torch.isnan(out).any()
+
+
+def test_decoder_default_config():
+    B = 2
+    decoder = Decoder(
+        image_size=(224, 224),
+        patch_size=16,
+        in_channels=3,
+        cls_dim=192,
+        hidden_dim=192,
+        depth=2,
+        n_heads=3,
+    )
+    # Check learnable query tokens count: (224/16)^2 = 196
+    assert decoder.num_patches == 196
+    assert decoder.query_tokens.shape == (1, 196, 192)
+
+    cls_token = torch.randn(B, 192)
+    out = decoder(cls_token)
+
+    assert out.shape == (B, 3, 224, 224)
+    assert not torch.isnan(out).any()
+
+
+def test_decoder_3d_input():
+    B = 2
+    decoder = Decoder(
+        image_size=(224, 224),
+        patch_size=16,
+        in_channels=3,
+        cls_dim=192,
+        hidden_dim=192,
+        depth=2,
+        n_heads=3,
+    )
+    cls_token_3d = torch.randn(B, 1, 192)
+    out = decoder(cls_token_3d)
+
+    assert out.shape == (B, 3, 224, 224)
+    assert not torch.isnan(out).any()
+
+
+def test_decoder_backward():
+    B = 2
+    decoder = Decoder(
+        image_size=(64, 64),
+        patch_size=16,
+        in_channels=3,
+        cls_dim=64,
+        hidden_dim=64,
+        depth=2,
+        n_heads=2,
+    )
+    cls_token = torch.randn(B, 64, requires_grad=True)
+    out = decoder(cls_token)
+    loss = out.sum()
+    loss.backward()
+
+    assert cls_token.grad is not None
+    assert decoder.query_tokens.grad is not None
+    assert decoder.pred_patch.weight.grad is not None
+
+
+def test_encoder_to_decoder_end_to_end():
+    B, C, H, W = 2, 3, 224, 224
+    encoder = Encoder(
+        image_size=(H, W),
+        patch_size=16,
+        in_channels=C,
+        hidden_dim=192,
+        depth=2,
+        n_heads=3,
+    )
+    decoder = Decoder(
+        image_size=(H, W),
+        patch_size=16,
+        in_channels=C,
+        cls_dim=192,
+        hidden_dim=192,
+        depth=2,
+        n_heads=3,
+    )
+    image = torch.randn(B, C, H, W)
+    cls_rep = encoder(image)
+    assert cls_rep.shape == (B, 192)
+
+    recon = decoder(cls_rep)
+    assert recon.shape == (B, C, H, W)

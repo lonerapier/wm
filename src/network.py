@@ -104,6 +104,67 @@ class ConditionalTransformerBlock(nn.Module):
         return x
 
 
+class CrossAttention(nn.Module):
+    def __init__(self, dim: int, n_heads: int, dropout: float = 0.0):
+        super().__init__()
+        assert dim % n_heads == 0, f"dim {dim} must be divisible by n_heads {n_heads}"
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+        self.q = nn.Linear(dim, dim, bias=True)
+        self.kv = nn.Linear(dim, dim * 2, bias=True)
+        self.proj = nn.Linear(dim, dim)
+        self.dropout = dropout
+
+    def forward(self, x: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+        # x (queries): (B, N_q, dim)
+        # kv (keys/values): (B, N_kv, dim)
+        B, N_q, C = x.shape
+        N_kv = kv.shape[1]
+
+        q = self.q(x).reshape(B, N_q, self.n_heads, self.head_dim).transpose(1, 2)
+        kv_proj = (
+            self.kv(kv).reshape(B, N_kv, 2, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        )
+        k, v = kv_proj.unbind(0)
+
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=self.dropout if self.training else 0.0,
+        )
+        out = out.transpose(1, 2).reshape(B, N_q, C)
+        return self.proj(out)
+
+
+class CrossAttentionBlock(nn.Module):
+    def __init__(
+        self,
+        hidden_dim: int,
+        mlp_ratio: int = 4,
+        n_heads: int = 3,
+        dropout: float = 0.0,
+        mlp_dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm_kv = nn.LayerNorm(hidden_dim)
+        self.attn = CrossAttention(hidden_dim, n_heads, dropout)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * mlp_ratio),
+            nn.GELU(),
+            nn.Dropout(mlp_dropout),
+            nn.Linear(hidden_dim * mlp_ratio, hidden_dim),
+            nn.Dropout(mlp_dropout),
+        )
+
+    def forward(self, x: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x), self.norm_kv(kv))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
 class Encoder(nn.Module):
     def __init__(
         self,
@@ -207,4 +268,101 @@ class ActionEmbedder(nn.Module):
 
 
 class Decoder(nn.Module):
-    pass
+    """Lightweight transformer decoder for visualising encoder state ([CLS] representation).
+
+    Decodes the [CLS] token embedding (192 dim by default) from the last encoder layer
+    into an RGB image (224x224 by default).
+    The [CLS] representation is first projected to a hidden dimension and used as key
+    and value in cross-attention. A fixed set of learnable query tokens (one per image patch,
+    P = (224/16)^2 = 196) interacts with this global representation through cross-attention
+    layers with residual MLP blocks. Resulting patch embeddings are linearly projected to
+    pixel patches and rearranged to produce the RGB image.
+    """
+
+    def __init__(
+        self,
+        image_size: tuple[int, int] | int = (224, 224),
+        patch_size: int = 16,
+        in_channels: int = 3,
+        cls_dim: int = 192,
+        hidden_dim: int = 192,
+        depth: int = 4,
+        n_heads: int = 3,
+        mlp_ratio: int = 4,
+        dropout: float = 0.0,
+        mlp_dropout: float = 0.0,
+    ):
+        super().__init__()
+        if isinstance(image_size, int):
+            image_size = (image_size, image_size)
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.in_channels = in_channels
+        self.cls_dim = cls_dim
+        self.hidden_dim = hidden_dim
+
+        assert image_size[0] % patch_size == 0 and image_size[1] % patch_size == 0, (
+            f"image_size {image_size} must be divisible by patch_size {patch_size}"
+        )
+
+        grid_h = image_size[0] // patch_size
+        grid_w = image_size[1] // patch_size
+        self.grid_size = (grid_h, grid_w)
+        self.num_patches = grid_h * grid_w
+
+        # Project [CLS] token embedding to hidden dimension for key and value in cross-attention
+        self.cls_proj = nn.Linear(cls_dim, hidden_dim)
+
+        # Fixed set of learnable query tokens, one for each patch of the target image
+        self.query_tokens = nn.Parameter(torch.randn(1, self.num_patches, hidden_dim) * 0.02)
+
+        # Cross-attention layers with residual MLP blocks
+        self.transformer_blocks = nn.ModuleList([
+            CrossAttentionBlock(
+                hidden_dim=hidden_dim,
+                mlp_ratio=mlp_ratio,
+                n_heads=n_heads,
+                dropout=dropout,
+                mlp_dropout=mlp_dropout,
+            )
+            for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(hidden_dim)
+
+        # Linearly project patch embeddings to patch_size * patch_size * in_channels
+        self.pred_patch = nn.Linear(hidden_dim, patch_size * patch_size * in_channels)
+
+    def forward(self, cls_token: torch.Tensor) -> torch.Tensor:
+        # cls_token shape: (B, cls_dim) or (B, 1, cls_dim)
+        assert cls_token.ndim in (2, 3)
+        assert cls_token.shape[-1] == self.cls_dim
+        if cls_token.ndim == 2:
+            cls_token = cls_token.unsqueeze(1)
+
+        B = cls_token.shape[0]
+
+        # [CLS] representation projected to hidden dimension, used as shared key and value
+        kv = self.cls_proj(cls_token)  # (B, 1, hidden_dim)
+
+        # Expand learnable query tokens for batch
+        x = self.query_tokens.expand(B, -1, -1)  # (B, num_patches, hidden_dim)
+
+        for block in self.transformer_blocks:
+            x = block(x, kv)
+        x = self.norm(x)
+
+        # Linearly project to patch pixels
+        patches = self.pred_patch(x)  # (B, num_patches, patch_size * patch_size * in_channels)
+
+        # Rearrange patches to produce (B, C, H, W) RGB image
+        grid_h, grid_w = self.grid_size
+        out = rearrange(
+            patches,
+            "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
+            h=grid_h,
+            w=grid_w,
+            p1=self.patch_size,
+            p2=self.patch_size,
+            c=self.in_channels,
+        )
+        return out

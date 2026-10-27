@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 import tyro
 from torch.utils.data import DataLoader
 
@@ -16,13 +17,15 @@ class PlanConfig:
     # Checkpoint and dataset setup
     checkpoint_path: Optional[str] = None
     """Path to trained model checkpoint containing weights and architecture config."""
-    data_path: str = "data/tworooms"
-    """Path to dataset directory / h5 files."""
+    data_path: Optional[str] = None
+    """Path to dataset directory / h5 files. Defaults to checkpoint's dataset if None."""
     batch_size: int = 16
     num_workers: int = 0
     seed: int = 42
     device: Optional[str] = None
     dtype: Optional[str] = None
+    num_eval_batches: Optional[int] = None
+    """Number of batches to evaluate planning on (None for all)."""
 
     # CEM planning hyperparameters
     iterations: int = 10
@@ -81,15 +84,14 @@ def cem_optimize(
     action_dim: int = 2,
     action_min: float = -1.0,
     action_max: float = 1.0,
-    init_mean: Optional[torch.Tensor] = None,
-    init_std: Optional[torch.Tensor] = None,
+    context_actions: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Execute Cross-Entropy Method (CEM) optimization for a batch of environments.
 
     Args:
         model: Trained world model (JEPA).
-        init_obs: (B, H_ctx, D) initial context frames.
-        goal_latent: (B, D) target goal embedding.
+        init_obs: (B, H_ctx, D) or (B, D) initial context frames.
+        goal_obs: (B, D) target goal embedding.
         horizon: Planning horizon steps T.
         candidates: Number of action candidates S sampled per iteration.
         elite_ratio: Ratio of elite samples retained.
@@ -98,14 +100,15 @@ def cem_optimize(
         action_dim: Dimension of each action.
         action_min: Lower bound for action clipping.
         action_max: Upper bound for action clipping.
-        init_mean: Optional warm-start mean distribution (B, H_ctx, A).
-        init_std: Optional warm-start standard deviation (B, H_ctx, A).
+        context_actions: Optional (B, H_ctx - 1, A) past actions during history context.
 
     Returns:
         best_actions: (B, T, A) optimal action sequence for each batch item.
         best_cost: (B,) final cost achieved by the best candidate.
     """
-    assert init_obs.ndim == 4, f"init_obs.ndim: {init_obs.ndim}"
+    assert init_obs.ndim in (2, 3), f"init_obs.ndim must be 2 or 3, got: {init_obs.ndim}"
+    if init_obs.ndim == 2:
+        init_obs = init_obs.unsqueeze(1)  # (B, 1, D)
     assert goal_obs.ndim == 2, f"goal_obs.ndim: {goal_obs.ndim}"
 
     device = init_obs.device
@@ -118,8 +121,12 @@ def cem_optimize(
     best_actions = mean.clone()
     best_cost = torch.full((B,), float("inf"), device=device)
 
-    # Expand context observation across candidate dimension S: (B, S, H_ctx, D)
-    init_obs_expanded = init_obs.unsqueeze(1).expand(-1, candidates, *init_obs.shape[1:])
+    # Expand context observation and actions across candidate dimension S: (B, S, H_ctx, D)
+    init_obs_expanded = init_obs.unsqueeze(1).expand(-1, candidates, -1, -1)
+    if context_actions is not None:
+        ctx_actions_expanded = context_actions.unsqueeze(1).expand(-1, candidates, -1, -1)
+    else:
+        ctx_actions_expanded = None
 
     for _ in range(iterations):
         # sample candidate action sequences: (B, S, T, A)
@@ -133,9 +140,12 @@ def cem_optimize(
             dtype=torch.bfloat16,
             enabled=(device.type == "cuda"),
         ):
-            pred_latents = model.predict_rollout(init_obs_expanded, actions)
+            pred_latents = model.predict_rollout(
+                init_obs=init_obs_expanded,
+                actions=actions,
+                context_actions=ctx_actions_expanded,
+            )
 
-        # compute cost for each candidate: (B, S)
         costs = planning_cost(pred_latents, goal_obs)
 
         # select top elite action sequences (smallest cost)
@@ -170,13 +180,17 @@ def cem_optimize(
 
 @torch.inference_mode()
 def plan(
-    model: torch.nn.Module,
+    model: JEPA,
     valloader: DataLoader,
     iterations: int = 10,
     candidates: int = 300,
     elite_ratio: float = 0.1,
     horizon: int = 5,
+    history_len: Optional[int] = None,
     smoothing: float = 0.1,
+    action_min: float = -1.0,
+    action_max: float = 1.0,
+    num_eval_batches: Optional[int] = None,
     device: torch.device = torch.device("cpu"),
     dtype: torch.dtype = torch.bfloat16,
 ) -> Dict[str, float]:
@@ -190,37 +204,60 @@ def plan(
         elite_ratio: Ratio of candidates selected as elites.
         horizon: Action planning horizon.
         smoothing: Smoothing parameter.
+        action_min: Minimum valid action bound.
+        action_max: Maximum valid action bound.
+        num_eval_batches: Maximum number of batches to evaluate (None for all).
         device: Device to run evaluation on.
+        dtype: Data type for computation.
 
     Returns:
         Dictionary of planning metrics.
     """
     model.eval()
 
-    total_cost = 0.0
+    total_cem_cost = 0.0
+    total_gt_cost = 0.0
+    total_action_l1 = 0.0
+    total_action_cos = 0.0
     num_samples = 0
 
-    # TODO: run on specifc obs indices
+    image_size = getattr(model.encoder, "image_size", None)
 
-    for batch in valloader:
-        image_size = getattr(model.encoder, "image_size", None)
+    for batch_idx, batch in enumerate(valloader):
+        if num_eval_batches is not None and batch_idx >= num_eval_batches:
+            break
+
         frames, actions = prepare_batch(batch, device=device, image_size=image_size)
-
         B, T = frames.shape[:2]
-        print(frames.shape, actions.shape)
+        action_dim = actions.shape[-1]
 
-        # Target goal embedding
         with torch.autocast(
             device_type=device.type,
             dtype=torch.bfloat16,
             enabled=(device.type == "cuda" and dtype == torch.bfloat16),
         ):
-            goal_latent, _ = model.encode(frames, actions)  # (B, T, D)
-            # Context observation (e.g. frame 0) and goal observation (e.g. terminal frame)
-            # TODO: observation can be a sequence of frames upto the receeding horizon
-            # TODO: look at history length for specific environment
-            init_obs_latent = goal_latent[:, 0]  # (B, D)
-            goal_latent = goal_latent[:, -1]  # (B, D)
+            latents, _ = model.encode(frames, actions)  # (B, T, D)
+
+            # Context observation: exactly history_len frames
+            init_obs_latent = latents[:, :history_len]  # (B, history_len, D)
+
+            # Goal latent is at index history_len - 1 + horizon
+            goal_idx = history_len - 1 + horizon
+            goal_latent = latents[:, goal_idx]  # (B, D)
+
+            # Ground truth actions for rollout
+            gt_ctx_actions = actions[:, : history_len - 1].unsqueeze(1) if history_len > 1 else None
+            gt_actions_seq = actions[:, history_len - 1 : goal_idx].unsqueeze(
+                1
+            )  # (B, 1, horizon, A)
+
+            gt_init_expanded = init_obs_latent.unsqueeze(1)  # (B, 1, history_len, D)
+            gt_pred_latents = model.predict_rollout(
+                init_obs=gt_init_expanded,
+                actions=gt_actions_seq,
+                context_actions=gt_ctx_actions,
+            )
+            gt_cost = planning_cost(gt_pred_latents, goal_latent).squeeze(1)  # (B,)
 
         best_actions, best_costs = cem_optimize(
             model=model,
@@ -231,14 +268,41 @@ def plan(
             elite_ratio=elite_ratio,
             iterations=iterations,
             smoothing=smoothing,
-            action_dim=actions.shape[-1],
+            action_dim=action_dim,
+            action_min=action_min,
+            action_max=action_max,
+            context_actions=actions[:, : history_len - 1] if history_len > 1 else None,
         )
 
-        total_cost += best_costs.sum().item()
+        gt_actions_target = actions[:, history_len - 1 : goal_idx]
+        gt_actions_flat = gt_actions_target.flatten(1)
+        best_actions_flat = best_actions.flatten(1)
+        l1_diff = torch.abs(best_actions - gt_actions_target).mean(dim=(1, 2))
+        cos_sim = F.cosine_similarity(best_actions_flat, gt_actions_flat, dim=-1)
+
+        total_cem_cost += best_costs.sum().item()
+        total_gt_cost += gt_cost.sum().item()
+        total_action_l1 += l1_diff.sum().item()
+        total_action_cos += cos_sim.sum().item()
         num_samples += B
 
-    avg_cost = total_cost / max(1, num_samples)
-    return {"plan/terminal_cost": avg_cost}
+        print(
+            f"[plan batch {batch_idx:3d}] CEM cost: {best_costs.mean().item():.4f} | "
+            f"GT cost: {gt_cost.mean().item():.4f} | "
+            f"Action cos-sim to GT: {cos_sim.mean().item():.4f}"
+        )
+
+    avg_cem_cost = total_cem_cost / max(1, num_samples)
+    avg_gt_cost = total_gt_cost / max(1, num_samples)
+
+    metrics = {
+        "plan/cem_terminal_cost": avg_cem_cost,
+        "plan/gt_terminal_cost": avg_gt_cost,
+        "plan/action_l1_to_gt": total_action_l1 / max(1, num_samples),
+        "plan/action_cosine_to_gt": total_action_cos / max(1, num_samples),
+        "plan/num_samples": num_samples,
+    }
+    return metrics
 
 
 def load_model_from_checkpoint(
@@ -256,7 +320,12 @@ def load_model_from_checkpoint(
     model_kwargs = {k: v for k, v in saved_cfg.items() if k in valid_params}
 
     model = JEPA(**model_kwargs)
-    model.load_state_dict(checkpoint["model"])
+    state_dict = {
+        k.removeprefix("_orig_mod.").removeprefix("module."): v
+        for k, v in checkpoint["model"].items()
+    }
+
+    model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
     return model, saved_cfg
@@ -274,15 +343,24 @@ def main(config: PlanConfig):
         print("[plan] No valid checkpoint provided; initializing default JEPA model.")
         model = JEPA().to(device)
         model.eval()
-        saved_cfg = {}
 
-    data_path = config.data_path or saved_cfg.get("data_path", "data/tworooms")
+    # load history_len + horizon frames for each episode in the validation set
+    frameskip = saved_cfg.get("frameskip", 1)
+    data_path = saved_cfg.get("data_path", config.data_path)
+    history_len = model.history_len
+    num_frames = history_len + config.horizon
+
+    print(
+        f"[plan] Setup: device={device}, data_path={data_path}, frameskip={frameskip}, "
+        f"history_len={history_len}, horizon={config.horizon}, num_frames={num_frames}, "
+        f"candidates={config.candidates}, iterations={config.iterations}"
+    )
 
     _, valloader = build_dataloaders(
         data_path=data_path,
         batch_size=config.batch_size,
-        num_frames=config.horizon + 1,
-        frameskip=config.frameskip,
+        num_frames=num_frames,
+        frameskip=frameskip,
         num_workers=config.num_workers,
         seed=config.seed,
     )
@@ -294,11 +372,23 @@ def main(config: PlanConfig):
         candidates=config.candidates,
         elite_ratio=config.elite_ratio,
         horizon=config.horizon,
+        history_len=history_len,
         smoothing=config.smoothing,
+        action_min=config.action_min,
+        action_max=config.action_max,
+        num_eval_batches=config.num_eval_batches,
         device=device,
         dtype=dtype,
     )
-    print(f"[plan] Evaluation completed. Metrics: {metrics}")
+    print("\n" + "=" * 50)
+    print("[plan] Evaluation completed successfully! Final Metrics:")
+    for k, v in metrics.items():
+        if isinstance(v, float):
+            print(f"  {k:35s}: {v:.6f}")
+        else:
+            print(f"  {k:35s}: {v}")
+    print("=" * 50)
+    return metrics
 
 
 if __name__ == "__main__":

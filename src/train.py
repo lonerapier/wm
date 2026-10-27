@@ -95,6 +95,8 @@ class TrainConfig:
     """Frame skip."""
     num_frames: int = 4
     """Number of frames."""
+    history_len: int = 1
+    """History length given to predictor (1 for tworooms, 3 for pusht/ogbench)."""
     sigreg_weight: float = 0.1
     """Weight for self-information-gain regularization."""
 
@@ -129,18 +131,15 @@ def main(config: TrainConfig):
     )
 
     # train data, val data
-    use_gpu_transforms = device.type == "cuda"
     trainloader, valloader = build_dataloaders(
         data_path=config.data_path,
         batch_size=config.batch_size,
         num_frames=config.num_frames,
         frameskip=config.frameskip,
         val_ratio=config.val_ratio,
-        image_size=config.image_size if not use_gpu_transforms else None,
         num_workers=config.num_workers,
         seed=config.seed,
         pin_memory=torch.cuda.is_available(),
-        return_uint8=use_gpu_transforms,
     )
     if len(trainloader) <= 0:
         raise RuntimeError("Training dataloader has zero batches.")
@@ -152,6 +151,7 @@ def main(config: TrainConfig):
         action_dim=config.action_dim,
         patch_size=config.patch_size,
         num_frames=config.num_frames,
+        history_len=config.history_len,
         enc_depth=config.enc_depth,
         hidden_dim=config.hidden_dim,
         n_heads=config.n_heads,

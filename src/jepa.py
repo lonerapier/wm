@@ -63,10 +63,12 @@ class JEPA(nn.Module):
         pred_emb_dropout: float = 0.1,
         enc_proj_hidden_dim: int = 2048,
         num_frames: int = 4,
+        history_len: int | None = None,
         pred_mlp_dim: int = 2048,
         pred_proj_hidden_dim: int = 2048,
     ):
         super().__init__()
+        self.history_len = history_len if history_len is not None else (num_frames - 1)
         self.encoder = Encoder(
             image_size=image_size,
             patch_size=patch_size,
@@ -76,9 +78,8 @@ class JEPA(nn.Module):
             n_heads=n_heads,
             mlp_ratio=mlp_ratio,
         )
-        # TODO: check the dropout settings for predictor
         self.predictor = Predictor(
-            num_frames=num_frames - 1,
+            num_frames=self.history_len,
             hidden_dim=hidden_dim,
             depth=pred_depth,
             n_heads=n_heads,
@@ -157,31 +158,47 @@ class JEPA(nn.Module):
         preds = self.pred_proj(rearrange(preds, "b t d -> (b t) d"))
         return rearrange(preds, "(b t) d -> b t d", b=B, t=T)
 
-    def predict_rollout(self, init_obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+    def predict_rollout(
+        self,
+        init_obs: torch.Tensor,
+        actions: torch.Tensor,
+        context_actions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Autoregressively predict future states using previous ground truth states and actions.
 
         Args:
-            init_obs (B, S, 1, D): Initial context frames.
+            init_obs (B, S, H_ctx, D): Initial context frames.
             actions (B, S, T, D): Action sequences to predict over.
+            context_actions (B, S, H_ctx - 1, D): Past actions during context history.
 
         Returns:
-            torch.Tensor: Predicted latent states.
+            torch.Tensor: Predicted latent states (B, S, T, D).
         """
-
         assert init_obs.ndim == 4, f"init_obs.ndim: {init_obs.ndim}"
         assert actions.ndim == 4, f"actions.ndim: {actions.ndim}"
 
         B, S = init_obs.shape[:2]
         T = actions.shape[2]
+        H_ctx = init_obs.shape[2]
 
+        max_ctx_len = min(self.history_len, self.predictor.pos_embed.shape[1])
         states = init_obs
 
-        max_ctx_len = self.predictor.pos_embed.shape[1]
+        if H_ctx > 1 and context_actions is not None:
+            all_actions = torch.cat([context_actions, actions], dim=2)
+            action_offset = context_actions.shape[2]
+        else:
+            all_actions = actions
+            action_offset = 0
 
         for t in range(T):
             ctx = min(states.shape[2], max_ctx_len)
             state_ctx = states[:, :, -ctx:]  # (B, S, ctx, D)
-            action_ctx = actions[:, :, (t + 1 - ctx) : t + 1]  # (B, S, ctx, D)
+
+            curr_action_idx = action_offset + t
+            start_act_idx = max(0, curr_action_idx + 1 - ctx)
+            end_act_idx = curr_action_idx + 1
+            action_ctx = all_actions[:, :, start_act_idx:end_act_idx]  # (B, S, ctx, D)
 
             state_ctx = rearrange(state_ctx, "b s ... -> (b s) ...")
             action_ctx = rearrange(action_ctx, "b s ... -> (b s) ...")
@@ -191,5 +208,5 @@ class JEPA(nn.Module):
             pred_state = rearrange(pred_state, "(b s) t d -> b s t d", b=B, s=S)
             states = torch.cat([states, pred_state[:, :, -1:]], dim=2)
 
-        # remove the original state, and return predicted states
-        return states[:, :, 1:]
+        # Remove the initial context states, and return predicted future states (B, S, T, D)
+        return states[:, :, H_ctx:]

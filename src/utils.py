@@ -120,7 +120,11 @@ def load_checkpoint(
             raise FileNotFoundError(f"Checkpoint file not found at '{checkpoint_path}'")
 
     checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint["model"])
+    state_dict = {
+        k.removeprefix("_orig_mod.").removeprefix("module."): v
+        for k, v in checkpoint["model"].items()
+    }
+    model.load_state_dict(state_dict)
     if optimizer is not None and checkpoint.get("optimizer") is not None:
         optimizer.load_state_dict(checkpoint["optimizer"])
     return checkpoint

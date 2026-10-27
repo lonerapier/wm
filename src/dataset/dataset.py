@@ -58,7 +58,6 @@ class LeWMDataset(Dataset):
         seed: int = 42,
         image_size: int | tuple[int, int] | None = None,
         normalizer: Normalizer | None = None,
-        return_uint8: bool = False,
     ):
         self.data: h5py.File | None = None
         self.split = split
@@ -67,7 +66,6 @@ class LeWMDataset(Dataset):
         self.span = self.num_frames * frameskip
         self.image_size = (image_size, image_size) if isinstance(image_size, int) else image_size
         self.normalizer = normalizer
-        self.return_uint8 = return_uint8
 
         self.h5_file_path = self._resolve_path(h5_file_path)
 
@@ -104,9 +102,8 @@ class LeWMDataset(Dataset):
             if length >= self.span:
                 starts.append(np.arange(offset, offset + length - self.span + 1, dtype=np.int64))
             else:
-                raise ValueError(
-                    f"Episode {ep} is too short for span {self.span}, length: {length}"
-                )
+                print(f"Episode {ep} is too short for span {self.span}, length: {length}")
+                continue
 
         self.valid_starts = np.concatenate(starts) if starts else np.empty(0, dtype=np.int64)
 
@@ -152,18 +149,8 @@ class LeWMDataset(Dataset):
         # Contiguous HDF5 read: reading [start:end] in one hyperslab is much faster than strided slicing
         raw_slice = data["pixels"][start:end]
         raw_pixels = np.ascontiguousarray(raw_slice[:: self.frameskip])
-
-        # TODO: remove `return_uint6` after testing
-        if getattr(self, "return_uint8", False):
-            # Return uint8 (T, C, H, W) for fast IPC transfer; normalization and resize done on GPU
-            pixels = torch.from_numpy(raw_pixels).permute(0, 3, 1, 2)
-        else:
-            # Legacy/default: float in [0, 1] resized on CPU
-            pixels = torch.from_numpy(raw_pixels).float().permute(0, 3, 1, 2) / 255.0
-            if self.image_size is not None and pixels.shape[-2:] != self.image_size:
-                pixels = F.interpolate(
-                    pixels, size=self.image_size, mode="bilinear", align_corners=False
-                )
+        # Return uint8 (T, C, H, W) for fast IPC transfer; normalization and resize done on device
+        pixels = torch.from_numpy(raw_pixels).permute(0, 3, 1, 2)
 
         # Actions: (num_frames, action_dim)
         raw_actions = data["action"][start:end]
@@ -198,7 +185,6 @@ def build_dataloaders(
     seed: int = 42,
     pin_memory: bool = True,
     normalizer: Normalizer | None = None,
-    return_uint8: bool = False,
     prefetch_factor: int = 4,
 ) -> tuple[DataLoader, DataLoader]:
     """Create train and validation DataLoaders with episode-level splits."""
@@ -211,7 +197,6 @@ def build_dataloaders(
         seed=seed,
         image_size=image_size,
         normalizer=normalizer,
-        return_uint8=return_uint8,
     )
     val_dataset = LeWMDataset(
         h5_file_path=data_path,
@@ -222,7 +207,6 @@ def build_dataloaders(
         seed=seed,
         image_size=image_size,
         normalizer=normalizer,
-        return_uint8=return_uint8,
     )
 
     train_loader = DataLoader(
